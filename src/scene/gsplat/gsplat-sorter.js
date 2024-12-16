@@ -1,6 +1,6 @@
 import { EventHandler } from '../../core/event-handler.js';
 import { TEXTURELOCK_READ } from '../../platform/graphics/constants.js';
-
+    
 // sort blind set of data
 function SortWorker() {
     let order;
@@ -17,24 +17,19 @@ function SortWorker() {
     const boundMin = { x: 0, y: 0, z: 0 };
     const boundMax = { x: 0, y: 0, z: 0 };
 
-    let distances;
-    let countBuffer;
+    // Outside update: Reused arrays and constants
+    let keys = null;
+    let tempIndices = null;
+    let countBuffers = null; // array of 4 count buffers
+    const RADIX_BITS = 8;
+    const RADIX = 1 << RADIX_BITS; // 256
+    const PASSES = 4; // 32 bits / 8 bits = 4 passes
 
-    const binarySearch = (m, n, compare_fn) => {
-        while (m <= n) {
-            const k = (n + m) >> 1;
-            const cmp = compare_fn(k);
-            if (cmp > 0) {
-                m = k + 1;
-            } else if (cmp < 0) {
-                n = k - 1;
-            } else {
-                return k;
-            }
-        }
-        return ~m;
-    };
+    // Float to sortable key transform
+    const f32 = new Float32Array(1);
+    const u32 = new Uint32Array(f32.buffer);
 
+    
     const update = () => {
         if (!order || !centers || centers.length === 0 || !cameraPosition || !cameraDirection) return;
 
@@ -66,75 +61,66 @@ function SortWorker() {
         lastCameraDirection.y = dy;
         lastCameraDirection.z = dz;
 
-        // calc min/max distance using bound
-        let minDist;
-        let maxDist;
-        for (let i = 0; i < 8; ++i) {
-            const x = (i & 1 ? boundMin.x : boundMax.x) - px;
-            const y = (i & 2 ? boundMin.y : boundMax.y) - py;
-            const z = (i & 4 ? boundMin.z : boundMax.z) - pz;
-            const d = x * dx + y * dy + z * dz;
-            if (i === 0) {
-                minDist = maxDist = d;
-            } else {
-                minDist = Math.min(minDist, d);
-                maxDist = Math.max(maxDist, d);
-            }
-        }
-
         const numVertices = centers.length / 3;
 
-        // calculate number of bits needed to store sorting result
-        const compareBits = Math.max(10, Math.min(20, Math.round(Math.log2(numVertices / 4))));
-        const bucketCount = 2 ** compareBits + 1;
-
-        // create distance buffer
-        if (distances?.length !== numVertices) {
-            distances = new Uint32Array(numVertices);
+        // Allocate arrays once if needed
+        if (!keys || keys.length !== numVertices) {
+            keys = new Uint32Array(numVertices);
+            tempIndices = new Uint32Array(numVertices);
+            // 4 count buffers for each byte pass
+            countBuffers = [new Uint32Array(RADIX), new Uint32Array(RADIX), new Uint32Array(RADIX), new Uint32Array(RADIX)];
+            // Initialize 'order' to identity if needed (it might already be)
+            for (let i = 0; i < numVertices; i++) {
+                order[i] = i;
+            }
         }
+        console.time('sort');
 
-        if (!countBuffer || countBuffer.length !== bucketCount) {
-            countBuffer = new Uint32Array(bucketCount);
-        } else {
-            countBuffer.fill(0);
-        }
-
-        // generate per vertex distance to camera
-        const range = maxDist - minDist;
-        const divider = (range < 1e-6) ? 0 : 1 / range * (2 ** compareBits);
-        for (let i = 0; i < numVertices; ++i) {
+        // Compute distances and keys
+        for (let i = 0; i < numVertices; i++) {
             const istride = i * 3;
-            const x = centers[istride + 0] - px;
+            const x = centers[istride] - px;
             const y = centers[istride + 1] - py;
             const z = centers[istride + 2] - pz;
-            const d = x * dx + y * dy + z * dz;
-            const sortKey = Math.floor((d - minDist) * divider);
+    
+            f32[0] = x * dx + y * dy + z * dz;
+            keys[i] = ~u32[0];
+            order[i] = i; 
+        }
+        
+        // Radix sort by 4 passes (8 bits each)
+        for (let pass = 0; pass < PASSES; pass++) {
+            // Clear count buffer
+            const count = countBuffers[pass];
+            count.fill(0);
 
-            distances[i] = sortKey;
+            const shift = pass * RADIX_BITS;
 
-            // count occurrences of each distance
-            countBuffer[sortKey]++;
+            // Count occurrences of each byte
+            for (let i = 0; i < numVertices; i++) {
+                const k = (keys[order[i]] >>> shift) & 0xFF;
+                count[k]++;
+            }
+
+            // Prefix sum to get stable positions
+            for (let r = 1; r < RADIX; r++) {
+                count[r] += count[r - 1];
+            }
+
+            // Stable distribution
+            for (let i = numVertices - 1; i >= 0; i--) {
+                const idx = order[i];
+                const k = (keys[idx] >>> shift) & 0xFF;
+                const pos = --count[k];
+                tempIndices[pos] = idx;
+            }
+ 
+            let tmp = order;
+            order = tempIndices;
+            tempIndices = tmp;
         }
 
-        // Change countBuffer[i] so that it contains actual position of this digit in outputArray
-        for (let i = 1; i < bucketCount; i++) {
-            countBuffer[i] += countBuffer[i - 1];
-        }
-
-        // Build the output array
-        for (let i = 0; i < numVertices; i++) {
-            const distance = distances[i];
-            const destIndex = --countBuffer[distance];
-            order[destIndex] = i;
-        }
-
-        // find splat with distance 0 to limit rendering behind the camera
-        const dist = i => distances[order[i]] / divider + minDist;
-        const findZero = () => {
-            const result = binarySearch(0, numVertices - 1, i => -dist(i));
-            return Math.min(numVertices, Math.abs(result));
-        };
-        const count = dist(numVertices - 1) >= 0 ? findZero() : numVertices;
+        console.timeEnd('sort');
 
         // apply mapping
         if (mapping) {
@@ -142,6 +128,8 @@ function SortWorker() {
                 order[i] = mapping[order[i]];
             }
         }
+        
+        const count = numVertices; // all vertices included
 
         // send results
         self.postMessage({
