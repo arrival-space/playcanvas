@@ -13,11 +13,6 @@ static uint32_t* keys = NULL;
 static uint32_t* orderTemp = NULL;
 static uint32_t* order = NULL;
 
-/**
- * Dynamically select the smallest histogram type depending on n.
- * We'll implement a small inline function that dispatches the sorting
- * to a templated function depending on the maximum range.
- */
 
 extern "C" void* wasm_malloc(size_t size) {
     return malloc(size);
@@ -39,7 +34,6 @@ extern "C" void* allocateBuffers(uint32_t numVertices) {
     order = (uint32_t*)malloc(numVertices * sizeof(uint32_t));
     return centers;
 }
-
 
 // Template function to perform the sorting using a given histogram type.
 // This matches the improved approach: skipping passes if uniform, early-exit if sorted, etc.
